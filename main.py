@@ -7,8 +7,8 @@ import yaml
 
 from ixp.experiment import Experiment
 from ixp.individual_difference import MOT, VS
-from ixp.surveys.nasa_tlx import NasaTLX
-from ixp.surveys.sart import SART
+from ixp.Surveys.nasa_tlx import NasaTLX
+from ixp.Surveys.sart import SART
 from tests.examples import ExampleSensor, ExampleTask
 from utils import skip_run
 
@@ -68,7 +68,7 @@ with skip_run('skip', 'individual_difference') as check, check():
     experiment.close()
 
 
-with skip_run('skip', 'multi_object_tracking') as check, check():
+with skip_run('run', 'multi_object_tracking') as check, check():
     ray.init(ignore_reinit_error=True, _system_config={'metrics_report_interval_ms': 0})
 
     # Create an instance of Experiment
