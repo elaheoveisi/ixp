@@ -78,7 +78,7 @@ class RemoteSensor:
         self.sensor.create_lsl_stream()
 
         self.recording: bool = False
-        self.current_task: str = 'INIT'
+        self.current_task: str = "INIT"
         self.sample_interval = sample_interval  # Optional throttling
 
     def start(self) -> None:
@@ -88,7 +88,7 @@ class RemoteSensor:
         This method is non-blocking when called via Ray.
 
         """
-        logger.info(f'[Sensor] Starting {self.name}')
+        logger.info(f"[Sensor] Starting {self.name}")
         self.recording = True
 
         while self.recording:
@@ -99,10 +99,10 @@ class RemoteSensor:
                 if self.sample_interval is not None:
                     time.sleep(self.sample_interval)
             except Exception as exc:  # noqa: PERF203
-                logger.exception(f'[Sensor] Error in {self.name}: {exc}')  # noqa: TRY401
+                logger.exception(f"[Sensor] Error in {self.name}: {exc}")  # noqa: TRY401
                 time.sleep(0.01)
 
-        logger.info(f'[Sensor] Stopped {self.name}')
+        logger.info(f"[Sensor] Stopped {self.name}")
 
     def stop(self) -> None:
         """
@@ -111,25 +111,19 @@ class RemoteSensor:
         """
         self.recording = False
 
-    def calibrate(self, screen: int = 0, fullscreen: bool = False) -> None:
+    def calibrate(self, **kwargs) -> None:
         """
         Pause recording, run the sensor's calibration procedure, then resume.
 
         Only has an effect if the underlying sensor implements ``calibrate()``.
-
-        Parameters
-        ----------
-        screen : int, optional
-            Screen index passed to the sensor's calibration window.
-        fullscreen : bool, optional
-            Whether to open the calibration window fullscreen.
+        All keyword arguments are forwarded to the sensor's ``calibrate()`` method.
 
         """
         was_recording = self.recording
         self.recording = False  # pause the start() loop
 
-        if hasattr(self.sensor, 'calibrate'):
-            self.sensor.calibrate(screen=screen, fullscreen=fullscreen)
+        if hasattr(self.sensor, "calibrate"):
+            self.sensor.calibrate(**kwargs)
 
         if was_recording:
             self.recording = True
@@ -220,10 +214,12 @@ class Experiment:
 
         """
         if not issubclass(task_cls, Task):
-            msg = 'task_cls must inherit from Task'
+            msg = "task_cls must inherit from Task"
             raise TypeError(msg)
 
-        pages = [instructions] if isinstance(instructions, str) else (instructions or [])
+        pages = (
+            [instructions] if isinstance(instructions, str) else (instructions or [])
+        )
 
         entry = TaskEntry(
             order=order,
@@ -239,7 +235,9 @@ class Experiment:
 
         actor = ray.remote(task_cls).remote(**task_config)
         ray.get(actor.is_ready.remote())
-        ray.get(actor.create_lsl_stream.remote())  # no-op if get_data_signature() returns None
+        ray.get(
+            actor.create_lsl_stream.remote()
+        )  # no-op if get_data_signature() returns None
         self.actors[name] = actor
 
     def register_sensor(
@@ -271,21 +269,18 @@ class Experiment:
             sample_interval=sample_interval,
         )
 
-    def calibrate_sensor(self, name: str, screen: int = 0, fullscreen: bool = False) -> None:
+    def calibrate_sensor(self, name: str, **kwargs) -> None:
         """
         Recalibrate a registered sensor by name.
 
         Blocks until calibration is complete. Safe to call between tasks
         or between trials (if the sensor actor handle is passed to the task).
+        All keyword arguments are forwarded to the sensor's ``calibrate()`` method.
 
         Parameters
         ----------
         name : str
             The sensor name used in ``register_sensor()``.
-        screen : int, optional
-            Screen index for the calibration window.
-        fullscreen : bool, optional
-            Whether to open the calibration window fullscreen.
 
         Raises
         ------
@@ -296,7 +291,7 @@ class Experiment:
         if name not in self.sensors:
             msg = f'No sensor named "{name}" registered.'
             raise KeyError(msg)
-        ray.get(self.sensors[name].calibrate.remote(screen=screen, fullscreen=fullscreen))
+        ray.get(self.sensors[name].calibrate.remote(**kwargs))
 
     def _run_task(
         self,
@@ -317,13 +312,19 @@ class Experiment:
             Pages of instruction text to display before the task runs.
 
         """
-        logger.info(f'Running task: {task_name}')
+        logger.info(f"Running task: {task_name}")
 
         # Show instructions before the task if provided
         if instructions:
-            screen = self.config.get('game', {}).get('display', 0)
-            fullscr = self.config.get('game', {}).get('fullscreen', False)
-            win = visual.Window(fullscr=fullscr, color='black', units='height', checkTiming=False, screen=screen)
+            screen = self.config.get("game", {}).get("display", 0)
+            fullscr = self.config.get("game", {}).get("fullscreen", False)
+            win = visual.Window(
+                fullscr=fullscr,
+                color="black",
+                units="height",
+                checkTiming=False,
+                screen=screen,
+            )
             InstructionScreen(win).show_pages(instructions)
             win.close()
 
@@ -353,20 +354,19 @@ class Experiment:
 
         """
         if not self.tasks and not self.practice_tasks:
-            msg = 'No tasks registered. Use add_task() before running.'
+            msg = "No tasks registered. Use add_task() before running."
             raise ValueError(msg)
 
-        logger.info('Starting experiment')
+        logger.info("Starting experiment")
 
-        practice_tasks = sorted(self.practice_tasks)
-        main_tasks = sorted(self.tasks)
-
-        run_practice = self.config.get('run_practice', False)
+        run_practice = self.config.get("run_practice", False)
 
         for sensor in self.sensors.values():
             sensor.start.remote()
 
         try:
+            practice_tasks = sorted(self.practice_tasks)
+            main_tasks = sorted(self.tasks)
             if run_practice:
                 for entry in practice_tasks:
                     self._run_task(entry.name, self.actors[entry.name], entry.pages)
@@ -377,7 +377,7 @@ class Experiment:
             for sensor in self.sensors.values():
                 sensor.stop.remote()
 
-        logger.info('Experiment finished')
+        logger.info("Experiment finished")
 
     def close(self) -> None:
         """
