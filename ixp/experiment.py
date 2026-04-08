@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import ray
+from psychopy import visual
 
+from .instruction import InstructionScreen
 from .task import Task
+from .utils import save_task_results
 
 if TYPE_CHECKING:
     from .sensors.base_sensor import Sensor
@@ -16,8 +19,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class TaskEntry(NamedTuple):
+    order: int
+    name: str
+    task_cls: type
+    task_config: dict[str, Any]
+    pages: list[str]
+
+
 # RemoteSensor handles sensor recording and streaming
-@ray.remote
+@ray.remote(max_concurrency=2)
 class RemoteSensor:
     """
     Ray actor that controls the lifecycle of a Sensor.
@@ -67,7 +78,7 @@ class RemoteSensor:
         self.sensor.create_lsl_stream()
 
         self.recording: bool = False
-        self.current_task: str = 'INIT'
+        self.current_task: str = "INIT"
         self.sample_interval = sample_interval  # Optional throttling
 
     def start(self) -> None:
@@ -77,7 +88,7 @@ class RemoteSensor:
         This method is non-blocking when called via Ray.
 
         """
-        logger.info(f'[Sensor] Starting {self.name}')
+        logger.info(f"[Sensor] Starting {self.name}")
         self.recording = True
 
         while self.recording:
@@ -88,10 +99,10 @@ class RemoteSensor:
                 if self.sample_interval is not None:
                     time.sleep(self.sample_interval)
             except Exception as exc:  # noqa: PERF203
-                logger.exception(f'[Sensor] Error in {self.name}: {exc}')  # noqa: TRY401
+                logger.exception(f"[Sensor] Error in {self.name}: {exc}")  # noqa: TRY401
                 time.sleep(0.01)
 
-        logger.info(f'[Sensor] Stopped {self.name}')
+        logger.info(f"[Sensor] Stopped {self.name}")
 
     def stop(self) -> None:
         """
@@ -99,6 +110,24 @@ class RemoteSensor:
 
         """
         self.recording = False
+
+    def calibrate(self, **kwargs) -> None:
+        """
+        Pause recording, run the sensor's calibration procedure, then resume.
+
+        Only has an effect if the underlying sensor implements ``calibrate()``.
+        All keyword arguments are forwarded to the sensor's ``calibrate()`` method.
+
+        """
+        was_recording = self.recording
+        self.recording = False  # pause the start() loop
+
+        if hasattr(self.sensor, "calibrate"):
+            self.sensor.calibrate(**kwargs)
+
+        if was_recording:
+            self.recording = True
+            self.start()
 
     def set_task(self, task_name: str) -> None:
         """
@@ -145,17 +174,19 @@ class Experiment:
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
-        self.tasks: list[tuple[str, ray.actor.ActorHandle]] = []
-        self.practice_tasks: list[tuple[str, ray.actor.ActorHandle]] = []
+        self.tasks: list[TaskEntry] = []
+        self.practice_tasks: list[TaskEntry] = []
         self.sensors: dict[str, ray.actor.ActorHandle] = {}
+        self.actors: dict[str, ray.actor.ActorHandle] = {}
 
-    def add_task(
+    def add_task(  # noqa: PLR0913
         self,
         name: str,
         task_cls: type,
         task_config: dict[str, Any],
         order: int = 0,
         is_practice: bool = False,  # noqa: FBT001, FBT002
+        instructions: list[str] | str | None = None,
     ) -> None:
         """
         Register a task with the experiment.
@@ -172,6 +203,9 @@ class Experiment:
             Execution order (lower values execute first). Default is 0.
         is_practice : bool, optional
             If True, registers as a practice task. Default is False.
+        instructions : list[str] | str | None, optional
+            Instruction text to display before this task runs. A single string
+            or a list of strings (shown as separate pages). Default is None.
 
         Raises
         ------
@@ -180,15 +214,31 @@ class Experiment:
 
         """
         if not issubclass(task_cls, Task):
-            msg = 'task_cls must inherit from Task'
+            msg = "task_cls must inherit from Task"
             raise TypeError(msg)
 
-        task_actor = ray.remote(task_cls).remote(**task_config)
+        pages = (
+            [instructions] if isinstance(instructions, str) else (instructions or [])
+        )
 
+        entry = TaskEntry(
+            order=order,
+            name=name,
+            task_cls=task_cls,
+            task_config=task_config,
+            pages=pages,
+        )
         if is_practice:
-            self.practice_tasks.append((name, task_actor, order))
+            self.practice_tasks.append(entry)
         else:
-            self.tasks.append((name, task_actor, order))
+            self.tasks.append(entry)
+
+        actor = ray.remote(task_cls).remote(**task_config)
+        ray.get(actor.is_ready.remote())
+        ray.get(
+            actor.create_lsl_stream.remote()
+        )  # no-op if get_data_signature() returns None
+        self.actors[name] = actor
 
     def register_sensor(
         self,
@@ -219,6 +269,80 @@ class Experiment:
             sample_interval=sample_interval,
         )
 
+    def calibrate_sensor(self, name: str, **kwargs) -> None:
+        """
+        Recalibrate a registered sensor by name.
+
+        Blocks until calibration is complete. Safe to call between tasks
+        or between trials (if the sensor actor handle is passed to the task).
+        All keyword arguments are forwarded to the sensor's ``calibrate()`` method.
+
+        Parameters
+        ----------
+        name : str
+            The sensor name used in ``register_sensor()``.
+
+        Raises
+        ------
+        KeyError
+            If no sensor with the given name is registered.
+
+        """
+        if name not in self.sensors:
+            msg = f'No sensor named "{name}" registered.'
+            raise KeyError(msg)
+        ray.get(self.sensors[name].calibrate.remote(**kwargs))
+
+    def _run_task(
+        self,
+        task_name: str,
+        task_actor: ray.actor.ActorHandle,
+        instructions: list[str] | None = None,
+    ) -> None:
+        """
+        Run a single task and synchronize sensors.
+
+        Parameters
+        ----------
+        task_name : str
+            Name of the task to run.
+        task_actor : ray.actor.ActorHandle
+            Ray actor handle for the task.
+        instructions : list[str] | None, optional
+            Pages of instruction text to display before the task runs.
+
+        """
+        logger.info(f"Running task: {task_name}")
+
+        # Show instructions before the task if provided
+        if instructions:
+            screen = self.config.get("game", {}).get("display", 0)
+            fullscr = self.config.get("game", {}).get("fullscreen", False)
+            win = visual.Window(
+                fullscr=fullscr,
+                color="black",
+                units="height",
+                checkTiming=False,
+                screen=screen,
+            )
+            InstructionScreen(win).show_pages(instructions)
+            win.close()
+
+        ray.get(task_actor.initial_setup.remote())
+
+        # Notify sensors of task context
+        for sensor in self.sensors.values():
+            sensor.set_task.remote(task_name)
+
+        # Execute task (blocking) and collect results
+        results = ray.get(task_actor.execute.remote())
+
+        # Save to CSV if the task returned row data (non-streaming tasks)
+        if results:
+            rows = results if isinstance(results, list) else [results]
+            if isinstance(rows[0], dict):
+                save_task_results(task_name, rows)
+
     def run(self) -> None:
         """
         Run the full experiment.
@@ -230,55 +354,30 @@ class Experiment:
 
         """
         if not self.tasks and not self.practice_tasks:
-            msg = 'No tasks registered. Use add_task() before running.'
+            msg = "No tasks registered. Use add_task() before running."
             raise ValueError(msg)
 
-        logger.info('Starting experiment')
+        logger.info("Starting experiment")
 
-        # Sort tasks by order
-        practice_tasks = sorted(self.practice_tasks, key=lambda x: x[2])
-        main_tasks = sorted(self.tasks, key=lambda x: x[2])
+        run_practice = self.config.get("run_practice", False)
 
-        # 1. Start sensors (parallel, non-blocking)
         for sensor in self.sensors.values():
             sensor.start.remote()
 
         try:
-            # 2. Run practice tasks
-            if self.config.get('run_practice', False):
-                for task_name, task_actor, _ in practice_tasks:
-                    self._run_task(task_name, task_actor)
+            practice_tasks = sorted(self.practice_tasks)
+            main_tasks = sorted(self.tasks)
+            if run_practice:
+                for entry in practice_tasks:
+                    self._run_task(entry.name, self.actors[entry.name], entry.pages)
 
-            # 3. Run main tasks
-            for task_name, task_actor, _ in main_tasks:
-                self._run_task(task_name, task_actor)
+            for entry in main_tasks:
+                self._run_task(entry.name, self.actors[entry.name], entry.pages)
         finally:
-            # 4. Stop sensors (always executed, even on task failure)
             for sensor in self.sensors.values():
                 sensor.stop.remote()
 
-        logger.info('Experiment finished')
-
-    def _run_task(self, task_name: str, task_actor: ray.actor.ActorHandle) -> None:
-        """
-        Run a single task and synchronize sensors.
-
-        Parameters
-        ----------
-        task_name : str
-            Name of the task to run.
-        task_actor : ray.actor.ActorHandle
-            Ray actor handle for the task.
-
-        """
-        logger.info(f'Running task: {task_name}')
-
-        # Notify sensors of task context
-        for sensor in self.sensors.values():
-            sensor.set_task.remote(task_name)
-
-        # Execute task (blocking)
-        ray.get(task_actor.execute.remote())
+        logger.info("Experiment finished")
 
     def close(self) -> None:
         """

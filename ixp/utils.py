@@ -1,32 +1,59 @@
 # Type validation utility
 from __future__ import annotations
 
+import csv
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
+logger = logging.getLogger(__name__)
+
+_RESULTS_ROOT = Path('results')
+
+
+def _next_subject_id() -> str:
+    """Return the next zero-padded subject ID based on existing sub-* folders."""
+    if not _RESULTS_ROOT.exists():
+        return '001'
+    existing = [
+        int(p.name[4:])
+        for p in _RESULTS_ROOT.iterdir()
+        if p.is_dir() and p.name.startswith('sub-') and p.name[4:].isdigit()
+    ]
+    return f'{(max(existing) + 1) if existing else 1:03d}'
 
 if TYPE_CHECKING:
     from .task import LSLTrial
 
 
-def validate(instance: object, base_types: tuple[type, ...]):
+def save_task_results(task_name: str, results: list[dict]) -> None:
     """
-    Validate that an instance is a subclass of the specified base types.
+    Save task results to a timestamped CSV under an auto-indexed subject folder.
+
+    Output path: ``results/sub-<NNN>/sub-<NNN>_<task_name>_<YYYYMMDD_HHMMSS>.csv``
 
     Parameters
     ----------
-    instance : object
-        The class or instance to validate.
-    base_types : tuple[type, ...]
-        Tuple of base types to check against.
-
-    Raises
-    ------
-    TypeError
-        If instance is not a subclass of any of the base types.
+    task_name : str
+        Name of the task.
+    results : list[dict]
+        List of row dicts where keys are column headers.
 
     """
-    if not issubclass(instance, base_types):
-        msg = f'{instance} must be a subclass of {base_types}'
-        raise TypeError(msg)
+    subject_id = _next_subject_id()
+    now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    timestamp = now_ct.strftime('%Y%m%d_%H%M%S')
+    filename = f'sub-P{subject_id}_{task_name}_{timestamp}.csv'
+    path = _RESULTS_ROOT / f'sub-P{subject_id}' / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+
+    logger.info('Results saved to %s', path)
 
 
 class StreamGuard:

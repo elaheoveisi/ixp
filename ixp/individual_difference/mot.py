@@ -125,7 +125,7 @@ class MOTTrial(Trial):
         core.wait(2.0)
         return selected
 
-    def execute(self) -> int:
+    def execute(self) -> dict:
         """Main trial logic loop."""
         # 1. Target Phase (Show targets)
         self._target_phase()
@@ -135,7 +135,13 @@ class MOTTrial(Trial):
 
         # 3. Selection Phase
         selected = self._selection_phase()
-        return sum(1 for c in selected if c['is_target'])
+        correct = sum(1 for c in selected if c['is_target'])
+        return {
+            'trial_id': self.trial_id,
+            'num_targets': self.num_targets,
+            'correct': correct,
+            'accuracy': correct / self.num_targets if self.num_targets > 0 else 0.0,
+        }
 
     def clean_up(self):
         """Clear references to stimuli to free memory."""
@@ -159,17 +165,17 @@ class MOT(Task):
     def execute(self, order: str = 'predefined'):
         # Initialize the PsychoPy window
         self.config['_window'] = visual.Window(
-            size=self.config.get('window_size', [1000, 800]),
             units='height',
             color=[0.5, 0.5, 0.5],  # Neutral grey
             fullscr=self.config.get('fullscreen', False),
+            screen=self.config.get('display', 0),
+            checkTiming=False,
         )
 
         try:
             results = []
             for block in self.blocks:
-                block_results = block.execute(order)
-                results.append(block_results)
+                results.extend(block.execute(order))
             return results
         finally:
             self.config['_window'].close()

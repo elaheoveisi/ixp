@@ -107,7 +107,13 @@ class VSTrial(Trial):
                 s.draw()
             self.win.flip()
 
-        return response, self.correct_answer, rt
+        return {
+            'trial_id': self.trial_id,
+            'response': response,
+            'correct_answer': self.correct_answer,
+            'correct': response == self.correct_answer,
+            'rt': round(rt, 4),
+        }
 
     def clean_up(self):
         self.stims = []
@@ -126,13 +132,16 @@ class VS(Task):
 
     def execute(self, order: str = 'predefined'):
         self.config['_window'] = visual.Window(
-            size=self.config.get('window_size', [1100, 800]),
             units='height',
             color=[0.5, 0.5, 0.5],  # RGB -1 to 1 or normalized
             fullscr=self.config.get('fullscreen', False),
+            screen=self.config.get('display', 0),
+            checkTiming=False,
         )
         try:
+            results = []
             for block in self.blocks:
-                block.execute(order)
+                results.extend(block.execute(order))
+            return results
         finally:
             self.config['_window'].close()

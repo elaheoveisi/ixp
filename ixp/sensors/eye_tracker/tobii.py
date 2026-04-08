@@ -1,11 +1,27 @@
 from __future__ import annotations
 
+import math
+import queue
 from typing import Any
 
 import tobii_research as tobii
-from psychopy import monitors, visual
+from psychopy import core, visual
 
 from ixp.sensors.base_sensor import Sensor
+from ixp.sensors.eye_tracker.data import (
+    get_3d_position,
+    get_eye_distance,
+    get_eye_validity,
+    get_gaze_position,
+    get_pupil_size,
+    get_trackbox_position,
+)
+from ixp.sensors.eye_tracker.utils import (
+    active_disp_to_mont_pix,
+    detect_screen_size_mm,
+    print_calibration_results,
+    show_calibration_point,
+)
 
 
 class TobiiEyeTracker(Sensor):
@@ -14,24 +30,10 @@ class TobiiEyeTracker(Sensor):
 
     Parameters
     ----------
-    config : dict[str, Any]
-        Configuration dictionary containing:
-        - name: Stream name (default: 'TobiiEyeTracker')
-        - type: Stream type (default: 'Gaze')
-        - channel_count: Number of channels (default: 6)
-        - nominal_srate: Sampling rate (default: 60)
-        - channel_format: Data format (default: 'float32')
-        - source_id: Unique source identifier
-        - serial_string: Serial number of specific tracker (optional)
-
-    Attributes
-    ----------
-    eyetracker : tobii.EyeTracker
-        Connected Tobii eye tracker device
-    tracking : bool
-        Current tracking status
-    gaze_data : dict
-        Latest gaze data from the tracker
+    config : dict, optional
+        Overrides for the default LSL stream settings. Keys: name, type,
+        channel_count (9), nominal_srate (60), channel_format, source_id,
+        serial_string (to target a specific device).
 
     """
 
@@ -39,7 +41,7 @@ class TobiiEyeTracker(Sensor):
         default_config = {
             'name': 'TobiiEyeTracker',
             'type': 'Gaze',
-            'channel_count': 6,  # left_x, left_y, left_z, right_x, right_y, right_z
+            'channel_count': 9,
             'nominal_srate': 60,
             'channel_format': 'float32',
             'source_id': 'tobii_eye_tracker',
@@ -52,94 +54,77 @@ class TobiiEyeTracker(Sensor):
         self.eyetracker = None
         self.tracking = False
         self.gaze_data: dict[str, Any] = {}
-        self._monitor = None
-
-        # Display coordinates
-        self.display_area: dict[str, tuple[float, float]] = {}
-        self.trackbox: dict[str, tuple[float, float]] = {}
+        self.win = None
+        self._gaze_queue: queue.Queue = queue.Queue()
 
     def initialize(self) -> None:
-        """
-        Initialize and connect to the Tobii eye tracker.
-
-        This method is called by RemoteSensor after instantiation.
-
-        """
+        """Connect to the tracker and start gaze streaming."""
         serial_string = self.config.get('serial_string')
         self.connect_to_tracker(serial_string)
         self.start_tracking()
 
     def get_data_signature(self) -> dict[str, Any]:
-        """
-        Return the data signature for the Tobii eye tracker.
-
-        Returns
-        -------
-        dict[str, Any]
-            Dictionary describing the data channels and their types.
-
-        """
+        """Return channel names and units for the 9-channel gaze stream."""
         return {
             'channels': [
-                'left_gaze_x',
-                'left_gaze_y',
-                'left_gaze_z',
-                'right_gaze_x',
-                'right_gaze_y',
-                'right_gaze_z',
+                'device_timestamp',
+                'avg_gaze_point_x',
+                'avg_gaze_point_y',
+                'avg_pupil_diam',
+                'avg_eye_pos_x',
+                'avg_eye_pos_y',
+                'avg_eye_pos_z',
+                'avg_eye_distance',
+                'eye_validities',
             ],
-            'units': 'normalized',
-            'coordinate_system': 'tobii_display_area',
+            'units': ['us', 'px', 'px', 'mm', 'mm', 'mm', 'mm', 'cm', 'code'],
         }
 
     def read_data(self) -> list[float] | None:
         """
-        Read current gaze data from the tracker.
+        Return 9-channel gaze sample or None if no data.
 
-        Returns
-        -------
-        list[float] or None
-            List of gaze coordinates [left_x, left_y, left_z, right_x, right_y, right_z]
-            or None if no data available.
-
+        Channels: device_timestamp, avg_gaze_point_x, avg_gaze_point_y, avg_pupil_diam,
+        avg_eye_pos_x, avg_eye_pos_y, avg_eye_pos_z, avg_eye_distance, eye_validities.
         """
-        if not self.gaze_data:
+        try:
+            gaze_data = self._gaze_queue.get_nowait()
+        except queue.Empty:
             return None
 
-        left = self.gaze_data.get('left_gaze_point_3d', (0.0, 0.0, 0.0))
-        right = self.gaze_data.get('right_gaze_point_3d', (0.0, 0.0, 0.0))
+        timestamp = gaze_data.get('device_time_stamp', 0.0)
 
-        # Handle None values
-        if left is None:
-            left = (0.0, 0.0, 0.0)
-        if right is None:
-            right = (0.0, 0.0, 0.0)
 
-        return [left[0], left[1], left[2], right[0], right[1], right[2]]
+        gaze_pos = get_gaze_position(gaze_data)
+        if self.win is not None and not any(math.isnan(v) for v in gaze_pos):
+            gaze_xy = active_disp_to_mont_pix(gaze_pos, self.win)
+        else:
+            gaze_xy = gaze_pos
+
+        avg_pupil = get_pupil_size(gaze_data)
+        eye_pos = get_3d_position(gaze_data)
+        eye_dist = get_eye_distance(eye_pos)
+        validities = get_eye_validity(gaze_data)
+
+        return [
+            timestamp,
+            gaze_xy[0],
+            gaze_xy[1],
+            avg_pupil,
+            eye_pos[0],
+            eye_pos[1],
+            eye_pos[2],
+            eye_dist,
+            float(validities),
+        ]
 
     def connect_to_tracker(self, serial_string: str | None = None) -> None:
-        """
-        Connect to a Tobii eye tracker.
-
-        Parameters
-        ----------
-        serial_string : str, optional
-            Serial number of the specific tracker to connect to
-
-        Raises
-        ------
-        ValueError
-            If no eye trackers are found
-        ConnectionError
-            If connection to the tracker fails
-
-        """
+        """Connect to the first found tracker, or to the one matching serial_string."""
         trackers = tobii.find_all_eyetrackers()
         if not trackers:
             msg = 'No eye trackers found'
             raise ValueError(msg)
 
-        selected_tracker = None
         if serial_string:
             selected_tracker = next((t for t in trackers if t.serial_number == serial_string), trackers[0])
         else:
@@ -147,113 +132,44 @@ class TobiiEyeTracker(Sensor):
 
         try:
             self.eyetracker = tobii.EyeTracker(selected_tracker.address)
-            log_msg = f'Connected to {selected_tracker.device_name} (Model: {selected_tracker.model}, S/N: {selected_tracker.serial_number})'
-            self.logger.info(log_msg)
+            self.logger.info(
+                'Connected to %s (Model: %s, S/N: %s)',
+                selected_tracker.device_name,
+                selected_tracker.model,
+                selected_tracker.serial_number,
+            )
         except ConnectionError as e:
             msg = f'Failed to connect: {e}'
             raise ConnectionError(msg) from e
 
-    def setup_display_area(self) -> None:
-        """
-        Initialize display area and trackbox coordinates.
+        self._apply_sampling_rate(self.config['nominal_srate'])
 
-        Raises
-        ------
-        ValueError
-            If eye tracker is not connected
+    def _apply_sampling_rate(self, desired_hz: float) -> None:
+        """Set tracker output frequency to desired_hz if supported; warn and use closest otherwise."""
+        supported = self.eyetracker.get_all_gaze_output_frequencies()
+        if not supported:
+            return
 
-        """
-        if not self.eyetracker:
-            msg = 'Eye tracker not connected'
-            raise ValueError(msg)
-
-        # Get display area coordinates
-        display = self.eyetracker.get_display_area()
-        self.display_area = {
-            'bottom_left': display.bottom_left,
-            'bottom_right': display.bottom_right,
-            'top_left': display.top_left,
-            'top_right': display.top_right,
-            'dimensions': (display.width, display.height),
-        }
-
-        # Get trackbox coordinates
-        box = self.eyetracker.get_track_box()
-        self.trackbox = {
-            'front_bottom_left': box.front_lower_left,
-            'front_bottom_right': box.front_lower_right,
-            'front_top_left': box.front_upper_left,
-            'front_top_right': box.front_upper_right,
-            'dimensions': (
-                abs(box.front_lower_right[0] - box.front_lower_left[0]),
-                abs(box.front_upper_left[1] - box.front_lower_left[1]),
-            ),
-        }
-
-    def setup_monitor(self, name: str | None = None, dimensions: tuple[int, int] | None = None) -> None:
-        """
-        Configure monitor settings.
-
-        Parameters
-        ----------
-        name : str, optional
-            Monitor name. Uses first available if None
-        dimensions : tuple(int, int), optional
-            Monitor dimensions (width, height). Uses window size if None
-
-        Raises
-        ------
-        ValueError
-            If no monitors are found
-        TypeError
-            If dimensions are not a tuple
-
-        """
-        available_monitors = monitors.getAllMonitors()
-        if not available_monitors:
-            msg = 'No monitors found'
-            raise ValueError(msg)
-
-        if dimensions is None:
-            temp_win = visual.Window(units='pix')
-            dimensions = tuple(temp_win.size)
-            temp_win.close()
-
-        if not isinstance(dimensions, tuple):
-            msg = 'Dimensions must be a tuple (width, height)'
-            raise TypeError(msg)
-
-        monitor_name = name or available_monitors[0]
-        monitor = monitors.Monitor(monitor_name)
-        monitor.setSizePix(dimensions)
-        monitor.saveMon()
-
-        self._monitor = monitor
-        log_msg = f'Monitor "{monitor_name}" configured: {dimensions!s}'
-        self.logger.info(log_msg)
+        if desired_hz in supported:
+            self.eyetracker.set_gaze_output_frequency(desired_hz)
+            self.logger.info('Gaze output frequency set to %.0f Hz', desired_hz)
+        else:
+            closest = min(supported, key=lambda f: abs(f - desired_hz))
+            self.eyetracker.set_gaze_output_frequency(closest)
+            self.logger.warning(
+                '%.0f Hz not supported by this device. Using %.0f Hz instead. Supported: %s',
+                desired_hz,
+                closest,
+                sorted(supported),
+            )
 
     def _gaze_callback(self, gaze_data: dict[str, Any]) -> None:
-        """
-        Store received gaze data.
-
-        Parameters
-        ----------
-        gaze_data : dict[str, Any]
-            Gaze data received from the tracker callback.
-
-        """
+        """Enqueue each gaze sample from the tracker callback."""
         self.gaze_data = gaze_data
+        self._gaze_queue.put(gaze_data)
 
     def start_tracking(self) -> None:
-        """
-        Start gaze data collection.
-
-        Raises
-        ------
-        ValueError
-            If eye tracker is not connected
-
-        """
+        """Subscribe to gaze data stream. Raises ValueError if not connected."""
         if not self.eyetracker:
             msg = 'Eye tracker not connected'
             raise ValueError(msg)
@@ -263,39 +179,162 @@ class TobiiEyeTracker(Sensor):
         self.logger.info('Gaze tracking started')
 
     def stop_tracking(self) -> None:
-        """
-        Stop gaze data collection.
-
-        Raises
-        ------
-        ValueError
-            If eye tracker is not connected
-
-        """
+        """Unsubscribe from gaze data stream. No-op if not currently tracking."""
         if not self.eyetracker:
             msg = 'Eye tracker not connected'
             raise ValueError(msg)
+
+        if not self.tracking:
+            return
 
         self.eyetracker.unsubscribe_from(tobii.EYETRACKER_GAZE_DATA, self._gaze_callback)
         self.tracking = False
         self.logger.info('Gaze tracking stopped')
 
-    def get_current_gaze(self) -> dict[str, Any] | None:
+    def set_display_area(
+        self,
+        width_mm: float | None = None,
+        height_mm: float | None = None,
+        mounting_offset_mm: float = 95.0,
+        screen: int = 0,
+    ) -> None:
         """
-        Get latest gaze data.
+        Set the tracker's display area in the User Coordinate System (mm).
 
-        Returns
-        -------
-        dict or None
-            Dictionary containing gaze data for both eyes and gaze position,
-            or None if no data available.
-
+        Dimensions are auto-detected via xrandr/tkinter when omitted.
+        mounting_offset_mm is the distance from the tracker's optical centre
+        to the bottom screen edge (default 95 mm for standard under-bezel mounts).
         """
+        if not self.eyetracker:
+            msg = 'Eye tracker not connected'
+            raise ValueError(msg)
+
+        if width_mm is None or height_mm is None:
+            detected_w, detected_h = detect_screen_size_mm(screen)
+            width_mm = width_mm if width_mm is not None else detected_w
+            height_mm = height_mm if height_mm is not None else detected_h
+            self.logger.info('Auto-detected screen size: %.1f x %.1f mm', width_mm, height_mm)
+
+        half_w = width_mm / 2.0
+        top_y = mounting_offset_mm + height_mm
+        display_area = tobii.DisplayArea(
+            {
+                'top_left': (-half_w, top_y, 0.0),
+                'top_right': (half_w, top_y, 0.0),
+                'bottom_left': (-half_w, mounting_offset_mm, 0.0),
+            }
+        )
+        self.eyetracker.set_display_area(display_area)
+        self.logger.info(
+            'Display area set: %.1f x %.1f mm, offset=%.1f mm',
+            width_mm,
+            height_mm,
+            mounting_offset_mm,
+        )
+
+    def calibrate(self, screen: int = 1, fullscreen: bool = True) -> None:  # noqa: FBT001, FBT002
+        """Run 5-point screen-based calibration. Uses self.win if set, otherwise creates a temporary window."""
+        # Use an externally supplied window, or create a temporary one.
+        own_win = self.win is None
+        win = (
+            self.win
+            if self.win is not None
+            else visual.Window(
+                fullscr=fullscreen,
+                screen=screen,
+                units='pix',
+                color='black',
+                checkTiming=False,
+            )
+        )
+
+        # Calibration target: outer ring shrinks toward a small inner dot to
+        # pull the participant's fovea to the exact centre before sampling.
+        outer_start = 40  # px - initial radius of outer ring
+        outer_end = 6  # px - final radius after animation
+        animate_dur = 3.0  # s  - shrink animation duration
+        hold_dur = 0.5  # s  - static hold before collecting data
+        inter_dur = 0.5  # s  - blank gap between points
+
+        target_outer = visual.Circle(win, radius=outer_start, fillColor='white', lineColor='white', units='pix')
+        target_inner = visual.Circle(win, radius=4, fillColor='black', lineColor='black', units='pix')
+
+        calibration = tobii.ScreenBasedCalibration(self.eyetracker)
+
+        # Enter calibration mode.  If the display area has not been configured
+        # on the device yet, attempt to derive it from the PsychoPy monitor
+        # before retrying once.
+        try:
+            calibration.enter_calibration_mode()
+        except tobii.EyeTrackerDisplayAreaNotValidError:
+            self.set_display_area()
+            calibration.enter_calibration_mode()
+
+        self.logger.info(
+            'Entered calibration mode for eye tracker %s',
+            self.eyetracker.serial_number,
+        )
+
+        # Normalized (0-1) calibration point positions; (0,0) = top-left.
+        # Points are kept 0.2 from each edge; 0.1 causes ~0.1 normalized-unit
+        # accuracy loss on the Tobii Spark at extreme gaze angles.
+        points_to_calibrate = [(0.5, 0.5), (0.2, 0.2), (0.2, 0.8), (0.8, 0.2), (0.8, 0.8)]
+
+        clock = core.Clock()
+        for point in points_to_calibrate:
+            escaped = show_calibration_point(
+                win,
+                calibration,
+                clock,
+                target_outer,
+                target_inner,
+                point,
+                outer_start,
+                outer_end,
+                animate_dur,
+                hold_dur,
+                inter_dur,
+            )
+            if escaped:
+                if own_win:
+                    win.close()
+                return
+
+        # Clear the screen while computing.
+        win.flip()
+
+        calibration_result = calibration.compute_and_apply()
+        print_calibration_results(calibration_result)
+        self.logger.info(
+            'Calibration result: %s, collected at %d points',
+            calibration_result.status,
+            len(calibration_result.calibration_points),
+        )
+
+        calibration.leave_calibration_mode()
+        self.logger.info('Left calibration mode')
+
+        if own_win:
+            win.close()
+
+    def set_window(self, win: visual.Window) -> None:
+        """Set the PsychoPy window used for calibration and validation."""
+        self.win = win
+
+    def get_trackbox_eye_pos(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """Return ((left_x, left_y), (right_x, right_y)) in PsychoPy norm trackbox space, or (0.99, 0.99) if invalid."""
         if not self.gaze_data:
-            return None
+            return (0.99, 0.99), (0.99, 0.99)
+        return get_trackbox_position(self.gaze_data)
 
-        return {
-            'left_eye': self.gaze_data.get('left_gaze_point_3d'),
-            'right_eye': self.gaze_data.get('right_gaze_point_3d'),
-            'gaze_position': self.gaze_data.get('gaze_point_on_display_area'),
-        }
+    def get_avg_eye_distance(self) -> float:
+        """Return average eye distance from tracker origin in centimeters, or 0 if no data."""
+        if not self.gaze_data:
+            return 0.0
+        return get_eye_distance(get_3d_position(self.gaze_data))
+
+    def get_avg_gaze_pos(self) -> tuple[float, float]:
+        """Return average (x, y) gaze position in ADA normalized coords, or (nan, nan) if no data."""
+        if not self.gaze_data:
+            return (float('nan'), float('nan'))
+        return get_gaze_position(self.gaze_data)
